@@ -1,1 +1,2 @@
-# FIT-IOS-projekt1
+# Corona
+Projekt 1 do předmětu IOS.
