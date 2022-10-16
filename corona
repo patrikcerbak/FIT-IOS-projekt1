@@ -1,0 +1,429 @@
+#!/bin/sh
+
+export POSIXLY_CORRECT=yes
+
+# function for printing a help text
+print_help() {
+    echo "Usage: corona [-h] [FILTERS] [COMMAND] [LOG [LOG2 [...]]"
+    echo "Analyze log files with COVID-19 cases in the Czech Republic."
+    echo ""
+    echo "Filters:"
+    echo "  -a DATETIME     process only the cases after (and including) DATETIME (YYYY-MM-DD)"
+    echo "  -b DATETIME     process only the cases before (and including) DATETIME (YYYY-MM-DD)"
+    echo "  -g GENDER       process only the cases with one gender (M or Z)"
+    echo "  -s [WIDTH]      display the data not as a number but as a graph (when applicable)"
+    echo "                  if the parameter WIDTH is not present, use the default value"
+    echo "Commands:"
+    echo "  infected        count the total number of infections"
+    echo "  merge           merge multiple files into one (it is also the default command)"
+    echo "  gender          print the number of infected people of each gender"
+    echo "  age             print the number of infected people by their age category"
+    echo "  daily           print the number of infected people in each day"
+    echo "  monthly         print the number of infected people in each month"
+    echo "  yearly          print the number of infected people in each year"
+    echo "  countries       print the country (if not CZ) and number of infections that came from it"
+    echo "  districts       print the number of infected people from each district"
+    echo "  regions         print the number of infected people from each region"
+    echo "  -h              show this help text"
+}
+
+# this awk code counts the number of occurrences for each item in a sorted list
+AWK_COUNT_AND_PRINT="awk -v last=\"-\" -v i=0 -v j=0 -v none=0 -v graph=\$GRAPH -v width=\$WIDTH -v default_width=\$DEFAULT_WIDTH '{
+        if(last == \"-\") {
+            # if it is the first item, load the value
+            last = \$0
+        }
+        if(last == \$0) {
+            # if the last item is the same as this one, add to counter
+            count++
+        } else {
+            # if it is different, save the label and counter to arrays
+            label[i++] = last
+            number[j++] = count
+            last = \$0
+            count = 1
+        }
+    }
+    END{
+        # count last item
+        if(last == \$0) {
+            label[i++] = last
+            number[j++] = count
+        } else {
+            label[i++] = \$0
+            number[j++] = 1
+        }
+
+        if(graph != 1) {
+            # print label and number
+            for(k = 0; k < i; k++) {
+                if(label[k] == \"\") {
+                    none = number[k]
+                } else {
+                    print label[k]\": \"number[k]
+                }
+            }
+            if(none != 0) {
+                # print none value
+                print \"None: \"none
+            }
+        } else {
+            # print data as graph
+            if(width != \"\") {
+                # find the maximum value
+                max = number[0]
+                for(l = 0; l < i; l++) {
+                    if(number[l] > max) {
+                        max = number[l]
+                    }
+                }
+
+                for(m = 0; m < i; m++) {
+                    if(label[m] == \"\") {
+                        # if the label is empty, initiate none variable
+                        none = number[m]
+                    } else {
+                        # print label and data as graph
+                        printf label[m]\": \"
+                        if(number[m] == max) { hashes = width } else { hashes = int(number[m]/(max/width)) }
+                        while(hashes != 0) {printf \"#\"; hashes--}; printf \"\n\"
+                    }
+                }
+                if(none != 0) {
+                    printf \"None: \"
+                    if(none == max) { hashes = width } else { hashes = int(none/(max/width)) }
+                    while(hashes != 0) {printf \"#\"; hashes--}; printf \"\n\"
+                }
+            } else {
+                # print data as graph with default width
+                for(n = 0; n < i; n++) {
+                    if(label[n] == \"\") {
+                        none = number[n]
+                    } else {
+                        printf label[n]\": \"
+                        hashes = int(number[n]/default_width)
+                        while(hashes != 0) {printf \"#\"; hashes--}; printf \"\n\"
+                    }
+                }
+                # print none if not 0
+                if(none != 0) {
+                    printf \"None: \"
+                    hashes = int(none/default_width)
+                    while(hashes != 0) {printf \"#\"; hashes--}; printf \"\n\"
+                }
+            }
+        }
+    }'"
+
+# this code is for checking the validity of date and age
+AWK_CHECK_DATA="awk '{
+        # check date format with regex
+        if(match(\$0, /^.*,[0-9]{4}-[0-9]{2}-[0-9]{2},.*,.*,.*,.*,.*,.*,.*$/)) {
+            # split the date by -
+            split(\$0, a, \",\"); split(a[2], date, \"-\")
+            # check values of year, month and day
+            if(date[1] < 1970 || date[2] < 1 || date[2] > 12 || date[3] < 1 || date[3] > 31) {
+                print \"Invalid date: \"\$0 > \"/dev/stderr\"
+            } else {
+                if(date[2] == 1 || date[2] == 3 || date[2] == 5 || date[2] == 7 || date[2] == 8 || date[2] == 10 || date[2] == 12) {
+                    # if month = these months than check is complete
+                    print \$0
+                } else if(date[2] == 2) {
+                    # if the month is february, check for leap years
+                    if(date[1] % 400 == 0 || (date[1] % 4 == 0 && date[1] % 100 != 0)) {
+                        if(date[3] > 29) {
+                            print \"Invalid date: \"\$0 > \"/dev/stderr\"
+                        } else {
+                            print \$0
+                        }
+                    } else {
+                        if(date[3] > 28) {
+                            print \"Invalid date: \"\$0 > \"/dev/stderr\"
+                        } else {
+                            print \$0
+                        }
+                    }
+                } else {
+                    # if it is the rest of the months, check if the day does not exceed 30
+                    if(date[3] > 30) {
+                        print \"Invalid date: \"\$0 > \"/dev/stderr\"
+                    } else {
+                        print \$0
+                    }
+                }
+            }
+        } else {
+            print \"Invalid date: \"\$0 > \"/dev/stderr\"
+        }
+    }' \
+    | awk '{
+        # check if the age is valid with regex
+        if(match(\$0, /^.*,.*,[0-9]*,.*,.*,.*,.*,.*,.*$/)) {print \$0} else {print \"Invalid age: \"\$0 > \"/dev/stderr\"}
+    }'"
+
+# this code gets variables and filters the data accordingly
+AWK_FILTER="awk -F, -v date_after=\$DATETIME_AFTER -v date_before=\$DATETIME_BEFORE -v gender=\$GENDER '{
+        # check whether date values are present, if not, give them *always true* values
+        if(date_after == \"\") {date_after = \"0000-00-00\"}; if(date_before == \"\") {date_before = \"9999-99-99\"}
+        # filter results by date
+        if(\$2 >= date_after && \$2 <= date_before) {
+            # and by gender
+            if(gender == \"\") {
+                print \$0
+            } else if(gender == \"M\" && \$4 == \"M\") {
+                print \$0
+            } else if(gender == \"Z\" && \$4 == \"Z\") {
+                print \$0
+            }
+        }
+    }'"
+
+COMMAND="merge"     # default command is merge
+FILES=""            # for storing names of uncompressed files
+GZ_FILES=""         # for storing names of .gz files
+BZ2_FILES=""        # for storing names of .bz2 files
+PRINTED_HEADER=0    # variable to determined whether the file header was already printed (merge function)
+WIDTH=""            # width of the -s argument
+
+# loop for getting arguments
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+    -h)
+        print_help
+        exit 0
+        ;;
+    infected | merge | gender | age | daily | monthly | yearly | countries | districts | regions)
+        COMMAND="$1"
+        shift
+        ;;
+    -a)
+        # check validity of the DATETIME with date command
+        if [ "$(date -d "$2" "+%Y-%m-%d" 2>/dev/null)" = "$2" ]; then
+            DATETIME_AFTER="$2"
+            shift
+            shift
+        else
+            echo "Wrong DATETIME format in the -a filter. (YYYY-MM-DD)" > /dev/stderr
+            exit 1
+        fi
+        ;;
+    -b)
+        # check validity of the DATETIME with date command
+        if [ "$(date -d "$2" "+%Y-%m-%d" 2>/dev/null)" = "$2" ]; then
+            DATETIME_BEFORE="$2"
+            shift
+            shift
+        else
+            echo "Wrong DATETIME format in the -b filter. (YYYY-MM-DD)" > /dev/stderr
+            exit 1
+        fi
+        ;;
+    -g)
+        # check validity of the GENDER argument (either M or Z)
+        if [ "$2" = "M" ] || [ "$2" = "Z" ]; then
+            GENDER="$2"
+            shift
+            shift
+        else
+            echo "Wrong GENDER in the -g filter. (M or Z)" > /dev/stderr
+            exit 1
+        fi
+        ;;
+    -s)
+        GRAPH=1
+        # check if the width argument is present
+        if echo "$2" | grep -q "^[0-9]*$"; then
+            WIDTH="$2"
+            shift
+        fi
+        shift
+        ;;
+    *.gz)
+        GZ_FILES="$GZ_FILES $1"
+        # if the command is merge, print the file
+        if [ "$COMMAND" = "merge" ]; then
+            # check if the header was printed
+            if [ "$PRINTED_HEADER" = 0 ]; then
+                printf "id,datum,vek,pohlavi,kraj_nuts_kod,okres_lau_kod,nakaza_v_zahranici,nakaza_zeme_csu_kod,reportovano_khs\n"
+                PRINTED_HEADER=1
+            fi
+            gzip -d -c -q "$1" 2>/dev/null | grep -v "^.*id,datum,vek,pohlavi,.*$" | eval "$AWK_CHECK_DATA" | eval "$AWK_FILTER"
+        fi
+        shift
+        ;;
+    *.bz2)
+        BZ2_FILES="$BZ2_FILES $1"
+        # if the command is merge, print the file
+        if [ "$COMMAND" = "merge" ]; then
+            # check if the header was printed
+            if [ "$PRINTED_HEADER" = 0 ]; then
+                printf "id,datum,vek,pohlavi,kraj_nuts_kod,okres_lau_kod,nakaza_v_zahranici,nakaza_zeme_csu_kod,reportovano_khs\n"
+                PRINTED_HEADER=1
+            fi
+            bzip2 -d -c -q "$1" 2>/dev/null | grep -v "^.*id,datum,vek,pohlavi,.*$" | eval "$AWK_CHECK_DATA" | eval "$AWK_FILTER"
+        fi
+        shift
+        ;;
+    *)
+        FILES="$FILES $1"
+        # if the command is merge, print the file
+        if [ "$COMMAND" = "merge" ]; then
+            # check if the header was printed
+            if [ "$PRINTED_HEADER" = 0 ]; then
+                printf "id,datum,vek,pohlavi,kraj_nuts_kod,okres_lau_kod,nakaza_v_zahranici,nakaza_zeme_csu_kod,reportovano_khs\n"
+                PRINTED_HEADER=1
+            fi
+            grep -v "^.*id,datum,vek,pohlavi,.*$" "$1" | eval "$AWK_CHECK_DATA" | eval "$AWK_FILTER"
+        fi
+        shift
+        ;;
+    esac
+done
+
+# if there are no files, get the input from stdin
+if [ "$FILES" = "" ] && [ "$GZ_FILES" = "" ] && [ "$BZ2_FILES" = "" ]; then
+    # if the command is merge, print stdin
+    if [ "$COMMAND" = "merge" ]; then
+        if [ "$PRINTED_HEADER" = 0 ]; then
+            printf "id,datum,vek,pohlavi,kraj_nuts_kod,okres_lau_kod,nakaza_v_zahranici,nakaza_zeme_csu_kod,reportovano_khs\n"
+            PRINTED_HEADER=1
+        fi
+        cat - | grep -v "^.*id,datum,vek,pohlavi,.*$" | eval "$AWK_CHECK_DATA" | eval "$AWK_FILTER"
+    else
+        # get the stdin into UNFILTERED variable
+        UNFILTERED="cat - | grep -v '^.*id,datum,vek,pohlavi,.*$'"
+    fi
+else
+    # else get the files into UNFILTERED variable
+    UNFILTERED="(gzip -d -c -q $GZ_FILES 2>/dev/null; bzip2 -d -c -q $BZ2_FILES 2>/dev/null) | cat $FILES - | grep -v '^.*id,datum,vek,pohlavi,.*$'"
+fi
+
+# FILTER variable adds commands for checking data and filtering it
+FILTERED="$UNFILTERED | $AWK_CHECK_DATA | $AWK_FILTER"
+
+# infected command - count FILTERED lines
+if [ "$COMMAND" = "infected" ]; then
+    eval "$FILTERED" | wc -l
+fi
+
+# gender command
+if [ "$COMMAND" = "gender" ]; then
+    DEFAULT_WIDTH=100000
+    eval "$FILTERED" | sort -t, -k4 | awk -F, '{ print $4 }' | eval "$AWK_COUNT_AND_PRINT"
+fi
+
+# age command
+if [ "$COMMAND" = "age" ]; then
+    DEFAULT_WIDTH=10000
+    if [ "$GRAPH" = 1 ]; then
+        GRAPH=2
+    fi
+    # the AWK_PRINT_AND_COUNT code works with each age, this code "puts" the ages into its categories ("0-5", "6-15" etc.)
+    eval "$FILTERED" | sort -t, -k3 | awk -F, '{ print $3 }' | eval "$AWK_COUNT_AND_PRINT" | awk -F': ' -v graph="$GRAPH" -v width="$WIDTH" -v default_width="$DEFAULT_WIDTH" '{
+            # prepare labels for values
+            labels[0]="0-5   : "; labels[1]="6-15  : "; j = 2
+            for(i = 16; i <= 86; i = i+10) { labels[j]=i"-"(i+9)" : "; j++ }
+            labels[10]="96-105: "; labels[11]=">105  : "; labels[12]="None  : "
+
+            # find values for each age category
+            if($1 == "None") {
+                numbers[12] = $2
+            } else if($1 > 105) {
+                numbers[11] += $2
+            } else {
+                l = 0
+                for(k = 5; k <= 105; k = k+10) {
+                    if($1 >= (k-9) && $1 <= k) {
+                        numbers[l] += $2
+                    }
+                    l++
+                }
+            }
+        }
+        END{
+            # if not graph, print the values
+            if(graph != 2) {
+                for(m = 0; m < 12; m++) {
+                    printf labels[m]
+                    if(numbers[m] != "") { printf numbers[m] } else { printf 0 }
+                    printf "\n"
+                }
+                if(numbers[12] != "") {
+                    print labels[12] numbers[12]
+                }
+            } else {
+                # show graph
+                if(width != "") {
+                    # find the maximum value
+                    max = numbers[0]
+                    for(n = 0; n < 13; n++) {
+                        if(numbers[n] > max) {
+                            max = numbers[n]
+                        }
+                    }
+
+                    # calculate and print the hashes
+                    for(o = 0; o < 12; o++) {
+                        printf labels[o]
+                        if(numbers[o] == max) { hashes = width } else { hashes = int(numbers[o]/(max/width)) }
+                        while(hashes != 0) {printf "#"; hashes--}; printf "\n"
+                    }
+                    if(numbers[12] != "") {
+                        print labels[12]
+                        if(numbers[12] == max) { hashes = width } else { hashes = int(numbers[12]/(max/width)) }
+                        while(hashes != 0) {printf "#"; hashes--}; printf "\n"
+                    }
+                } else {
+                    # if the width is not present, calculate and print hashed with default_width
+                    for(p = 0; p < 12; p++) {
+                        printf labels[p]
+                        hashes = int(numbers[p]/default_width)
+                        while(hashes != 0) {printf "#"; hashes--}; printf "\n"
+                    }
+                    if(numbers[12] != "") {
+                        printf labels[12]
+                        hashes = int(numbers[12]/default_width)
+                        while(hashes != 0) {printf "#"; hashes--}; printf "\n"
+                    }
+                }
+            }
+        }'
+fi
+
+# daily command
+if [ "$COMMAND" = "daily" ]; then
+    DEFAULT_WIDTH=500
+    eval "$FILTERED" | sort -t, -k2 | awk -F, '{ print $2 }' | eval "$AWK_COUNT_AND_PRINT"
+fi
+
+# monthly command - cuts the string using awk to YYYY-MM format and runs AWK_COUNT_AND_PRINT code
+if [ "$COMMAND" = "monthly" ]; then
+    DEFAULT_WIDTH=10000
+    eval "$FILTERED" | sort -t, -k2 | awk -F, '{ print $2 }' | awk -F- '{ if($0 != "") {print $1"-"$2} else {print ""} }' | eval "$AWK_COUNT_AND_PRINT"
+fi
+
+# yearly command - cuts the string using awk to just the year and runs AWK_COUNT_AND_PRINT code
+if [ "$COMMAND" = "yearly" ]; then
+    DEFAULT_WIDTH=100000
+    eval "$FILTERED" | sort -t, -k2 | awk -F, '{ print $2 }' | awk -F- '{ if($0 != "") {print $1} else {print ""} }' | eval "$AWK_COUNT_AND_PRINT"
+fi
+
+# countries command - works with all countries code except "CZ" and ""
+if [ "$COMMAND" = "countries" ]; then
+    DEFAULT_WIDTH=100
+    eval "$FILTERED" | sort -t, -k8 | awk -F, '{ if($8 != "" && $8 != "CZ") {print $8} }' | eval "$AWK_COUNT_AND_PRINT"
+fi
+
+# districts command
+if [ "$COMMAND" = "districts" ]; then
+    DEFAULT_WIDTH=1000
+    eval "$FILTERED" | sort -t, -k6 | awk -F, '{ print $6 }' | eval "$AWK_COUNT_AND_PRINT"
+fi
+
+# regions command
+if [ "$COMMAND" = "regions" ]; then
+    DEFAULT_WIDTH=10000
+    eval "$FILTERED" | sort -t, -k5 | awk -F, '{ print $5 }' | eval "$AWK_COUNT_AND_PRINT"
+fi
+
+exit 0
